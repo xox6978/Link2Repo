@@ -1,0 +1,339 @@
+ # __  __           _       __        ___ _   _       _                    
+ #|  \/  | __ _  __| | ___  \ \      / (_) |_| |__   | |    _____   _____  
+ #| |\/| |/ _` |/ _` |/ _ \  \ \ /\ / /| | __| '_ \  | |   / _ \ \ / / _ \ 
+ #| |  | | (_| | (_| |  __/   \ V  V / | | |_| | | | | |__| (_) \ V /  __/ 
+ #|_|  |_|\__,_|\__,_|\___|  _ \_/\_/  |_|\__|_|_|_| |_____\___/ \_/ \___| 
+ #| |__  _   _  \ \   / /_ _| | |_ ___  _ __| __ ) _   _| |_ ___           
+ #| '_ \| | | |  \ \ / / _` | | __/ _ \| '__|  _ \| | | | __/ _ \          
+ #| |_) | |_| |   \ V / (_| | | || (_) | |  | |_) | |_| | ||  __/          
+ #|_.__/ \__, |    \_/ \__,_|_|\__\___/|_|  |____/ \__, |\__\___|          
+ #       |___/                                     |___/                   
+ 
+name: YouTube Downloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+
+      output_format:
+        description: 'output type'
+        required: true
+        type: choice
+        options:
+          - mp4 (video)
+          - mp3 (audio only)
+        default: 'mp4 (video)'
+
+      desired_quality:
+        description: 'Quality (Video: 720p, 1080p | Audio: 192kbps, 320kbps)'
+        required: false
+        type: choice
+        options:
+          - 720p
+          - 1080p
+          - 192kbps
+          - 320kbps
+        default: '720p'
+
+      max_part_mb:
+        description: 'Stay Under 100'
+        required: false
+        type: string
+        default: '95'
+
+permissions:
+  contents: write
+
+jobs:
+  youtube-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: 📂 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔧 Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zip curl python3 python3-pip
+          pip3 install --quiet requests yt-dlp
+
+      - name: 🔗 Get Download Link
+        id: retrieve
+        run: |
+          python3 << 'EOF'
+          import os, sys, time, re, requests, subprocess, json
+
+          URL  = os.environ.get('INPUT_URL')
+          FMT  = os.environ.get('INPUT_FORMAT')
+          QUAL = os.environ.get('INPUT_QUALITY')
+
+          is_audio = FMT == 'mp3'
+          if is_audio:
+              QUAL = QUAL if QUAL in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
+          else:
+              QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
+
+          # ── Fetch publish date via yt-dlp (metadata only, no download) ───
+          publish_date = 'N/A'
+          channel      = 'N/A'
+          duration_str = 'N/A'
+          try:
+              r = subprocess.run(
+                  ['yt-dlp', '--dump-json', '--skip-download', '--no-playlist', URL],
+                  capture_output=True, text=True, timeout=60
+              )
+              if r.returncode == 0:
+                  meta = json.loads(r.stdout)
+                  raw  = meta.get('upload_date', '')
+                  if raw and len(raw) == 8:
+                      publish_date = f"{raw[:4]}-{raw[4:6]}-{raw[6:]}"
+                  channel = meta.get('channel') or meta.get('uploader', 'N/A')
+                  secs = int(meta.get('duration') or 0)
+                  if secs:
+                      h, m, s = secs // 3600, (secs % 3600) // 60, secs % 60
+                      duration_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+          except Exception as e:
+              print(f"Warning: yt-dlp metadata skipped: {e}", file=sys.stderr)
+
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {"type": "audio" if is_audio else "video", "format": FMT}
+          }
+          if is_audio:
+              payload["audio"] = {"bitrate": QUAL}
+          else:
+              payload["output"]["quality"] = QUAL
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+          s.get("https://media.ytmp3.gg/")
+
+          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+          resp.raise_for_status()
+          data = resp.json()
+
+          status_url = data.get('statusUrl')
+          title = data.get('title', 'video')
+
+          dl_url = None
+          for _ in range(150):
+              time.sleep(2)
+              r = s.get(status_url, timeout=20)
+              status = r.json()
+              if status.get('status') == 'completed':
+                  dl_url = status.get('downloadUrl')
+                  break
+              if status.get('status') == 'failed':
+                  print("::error::Server failed to prepare the video")
+                  sys.exit(1)
+
+          if not dl_url:
+              print("::error::Could not get download link")
+              sys.exit(1)
+
+          vid   = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL)[1]
+          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
+          clean = re.sub(r'_+', '_', clean).strip('_')[:70] or vid
+          clean = clean.lstrip('-')
+          fname = f"{clean}_{vid}_{QUAL}.{FMT}"
+
+          with open(".download_info", "w", encoding="utf-8") as f:
+              f.write(f"{dl_url}\n{fname}\n{title}")
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"filename={fname}\n")
+              f.write(f"title={title}\n")
+              f.write(f"publish_date={publish_date}\n")
+              f.write(f"channel={channel}\n")
+              f.write(f"duration={duration_str}\n")
+          EOF
+        env:
+          INPUT_URL:     ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT:  ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+
+      - name: 📥 Download File
+        run: |
+          DL_URL=$(head -1 .download_info)
+          FILENAME=$(sed -n '2p' .download_info)
+
+          mkdir -p tmp_downloads dl
+          echo "Downloading: $FILENAME"
+          curl -L --fail --progress-bar -o "tmp_downloads/$FILENAME" "$DL_URL"
+
+          if [ ! -s "tmp_downloads/$FILENAME" ]; then
+            echo "::error::Downloaded file is empty!"
+            exit 1
+          fi
+
+      - name: ✂️ Split Large File (if needed)
+        run: |
+          FILENAME="${{ steps.retrieve.outputs.filename }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+
+          if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+
+          FILESIZE=$(stat -c%s "tmp_downloads/$FILENAME" 2>/dev/null || echo 0)
+          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+
+          rm -f new_files.txt
+          touch new_files.txt
+
+          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+            echo "🔪 Splitting into ${THRESH_MB}MB parts..."
+            BASE="${FILENAME%.*}"
+
+            cd tmp_downloads
+            zip -r -s "${THRESH_MB}m" "../dl/${BASE}.zip" "./$FILENAME"
+            cd ..
+
+            rm -f "tmp_downloads/$FILENAME"
+
+            for PART in dl/${BASE}.zip dl/${BASE}.z*; do
+              [ -f "$PART" ] && basename "$PART" >> new_files.txt
+            done
+          else
+            echo "📦 No split needed ($(( FILESIZE / 1024 / 1024 )) MB)"
+            cp -f "tmp_downloads/$FILENAME" "dl/$FILENAME"
+            echo "$FILENAME" >> new_files.txt
+          fi
+
+      - name: 🧾 Update YT.md
+        env:
+          REPO:         ${{ github.repository }}
+          TITLE:        ${{ steps.retrieve.outputs.title }}
+          PUBLISH_DATE: ${{ steps.retrieve.outputs.publish_date }}
+          CHANNEL:      ${{ steps.retrieve.outputs.channel }}
+          DURATION:     ${{ steps.retrieve.outputs.duration }}
+          QUALITY:      ${{ github.event.inputs.desired_quality }}
+          OUT_FORMAT:   ${{ github.event.inputs.output_format }}
+          VIDEO_URL:    ${{ github.event.inputs.video_url }}
+        run: |
+          [ ! -f new_files.txt ] && exit 0
+
+          DOWNLOAD_DATE=$(TZ='Asia/Tehran' date +'%Y-%m-%d %H:%M IR')
+          export DOWNLOAD_DATE
+          export BRANCH="${GITHUB_REF_NAME}"
+
+          python3 << 'PYEOF'
+          import os, re, urllib.parse
+
+          repo          = os.environ.get('REPO', '')
+          branch        = os.environ.get('BRANCH', '')
+          title         = os.environ.get('TITLE', 'Unknown')
+          publish_date  = os.environ.get('PUBLISH_DATE', 'N/A')
+          channel       = os.environ.get('CHANNEL', 'N/A')
+          duration      = os.environ.get('DURATION', 'N/A')
+          quality       = os.environ.get('QUALITY', '')
+          out_fmt       = os.environ.get('OUT_FORMAT', '')
+          video_url     = os.environ.get('VIDEO_URL', '')
+          download_date = os.environ.get('DOWNLOAD_DATE', '')
+
+          fmt_clean = 'MP3' if 'mp3' in out_fmt else 'MP4'
+
+          HEADER = (
+              "## 🔗 Direct Download Links\n"
+              "> ❤ Made With Love by ValtorByte ❤<br><br/>\n\n"
+          )
+          FOOTER = "\n---\n\Click on any link below to start downloading directly.\n"
+
+          with open('new_files.txt') as f:
+              new_files = [l.strip() for l in f if l.strip()]
+          if not new_files:
+              exit(0)
+
+          # Total size
+          total_bytes = sum(
+              os.path.getsize(f"dl/{fn}")
+              for fn in new_files if os.path.exists(f"dl/{fn}")
+          )
+          def fsize(b):
+              return f"{b/1048576:.1f} MB" if b >= 1048576 else f"{b//1024} KB"
+
+          # Build entry
+          lines = []
+          lines.append(f"### 🎬 {title}")
+          lines.append(
+              f"> 📺 `{channel}` &nbsp;|&nbsp; "
+              f"🕒 `{duration}` &nbsp;|&nbsp; "
+              f"📅 Published: `{publish_date}`"
+          )
+          lines.append(
+              f"> 📥 Downloaded: `{download_date}` &nbsp;|&nbsp; "
+              f"💾 `{fmt_clean} · {quality}` &nbsp;|&nbsp; "
+              f"📦 `{fsize(total_bytes)}`"
+          )
+          lines.append("")
+
+          is_split = len(new_files) > 1
+          for i, fname in enumerate(new_files, 1):
+              encoded  = urllib.parse.quote(fname)
+              raw_url  = f"https://github.com/{repo}/raw/{branch}/dl/{encoded}"
+              display  = re.sub(r'android\d+\+_', '', fname).replace('-release', '')
+              fpath    = f"dl/{fname}"
+              size     = os.path.getsize(fpath) if os.path.exists(fpath) else 0
+              size_str = fsize(size)
+              ext      = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+
+              if ext in ('mp4', 'mkv', 'avi', 'mov'):   icon = "🎬"
+              elif ext in ('mp3', 'm4a', 'flac', 'ogg'): icon = "🎵"
+              elif ext == 'zip' or re.match(r'^z\d+$', ext): icon = "🗜️"
+              else: icon = "📥"
+
+              label = f"Part {i}" if is_split else display
+              lines.append(f"- {icon} [{label}]({raw_url}) `{size_str}`")
+
+          if video_url:
+              lines.append(f"- 🔗 [Watch on YouTube]({video_url})")
+
+          lines.append("")
+          lines.append("---")
+          lines.append("")
+          current_entry = "\n".join(lines)
+
+          # Preserve old entries
+          old_entries = ""
+          if os.path.exists("YT.md"):
+              with open("YT.md", "r", encoding="utf-8") as f:
+                  content = f.read()
+              content = re.sub(r'\n*---\n+❤.*?❤\s*$', '', content, flags=re.DOTALL)
+              m = re.search(r'^### ', content, re.MULTILINE)
+              if m:
+                  old_entries = content[m.start():].rstrip()
+
+          with open("YT.md", "w", encoding="utf-8") as f:
+              f.write(HEADER)
+              f.write(current_entry)
+              if old_entries:
+                  f.write(old_entries + "\n")
+              f.write(FOOTER)
+          PYEOF
+
+          rm -f new_files.txt current_run.md
+
+      - name: 📅 Get Current Date
+        id: get_date
+        run: echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
+
+      - name: 📤 Push to Repository
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dl/ YT.md
+          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+          git push
+
+      - name: 🧹 Cleanup
+        if: always()
+        run: rm -rf tmp_downloads .download_info new_files.txt current_run.md old_YT.md 2>/dev/null || true
