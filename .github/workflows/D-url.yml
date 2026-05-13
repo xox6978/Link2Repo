@@ -1,0 +1,296 @@
+ # __  __           _       __        ___ _   _       _                    
+ #|  \/  | __ _  __| | ___  \ \      / (_) |_| |__   | |    _____   _____  
+ #| |\/| |/ _` |/ _` |/ _ \  \ \ /\ / /| | __| '_ \  | |   / _ \ \ / / _ \ 
+ #| |  | | (_| | (_| |  __/   \ V  V / | | |_| | | | | |__| (_) \ V /  __/ 
+ #|_|  |_|\__,_|\__,_|\___|  _ \_/\_/  |_|\__|_|_|_| |_____\___/ \_/ \___| 
+ #| |__  _   _  \ \   / /_ _| | |_ ___  _ __| __ ) _   _| |_ ___           
+ #| '_ \| | | |  \ \ / / _` | | __/ _ \| '__|  _ \| | | | __/ _ \          
+ #| |_) | |_| |   \ V / (_| | | || (_) | |  | |_) | |_| | ||  __/          
+ #|_.__/ \__, |    \_/ \__,_|_|\__\___/|_|  |____/ \__, |\__\___|          
+ #       |___/                                     |___/                   
+ 
+name: Straightforward URL Downloader
+ 
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "Direct File URL"
+        required: true
+        type: string
+ 
+      custom_filename:
+        description: "Custom filename (optional)"
+        required: false
+        default: ""
+        type: string
+ 
+      zip_password:
+        description: "Password for archive (optional)"
+        required: false
+        default: ""
+        type: string
+ 
+      max_part_mb:
+        description: "Maximum MB size per part (Stay Under 100)"
+        required: false
+        default: "95"
+        type: string
+ 
+permissions:
+  contents: write
+ 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+ 
+jobs:
+  direct-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+ 
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+ 
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y p7zip-full curl python3
+ 
+      - name: Download File
+        id: download
+        shell: bash
+        run: |
+          mkdir -p temp_dl
+ 
+          FILE_URL="${{ github.event.inputs.file_url }}"
+          CUSTOM_NAME="${{ github.event.inputs.custom_filename }}"
+ 
+          URL_FILENAME=$(basename "$FILE_URL" | cut -d'?' -f1)
+          URL_FILENAME=$(echo "$URL_FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+ 
+          if [ -n "$CUSTOM_NAME" ]; then
+            URL_EXT="${URL_FILENAME##*.}"
+            CUSTOM_EXT="${CUSTOM_NAME##*.}"
+            if [ "$CUSTOM_EXT" = "$CUSTOM_NAME" ] || [ -z "$CUSTOM_EXT" ]; then
+              FILENAME="${CUSTOM_NAME}.${URL_EXT}"
+            else
+              FILENAME="$CUSTOM_NAME"
+            fi
+            FILENAME=$(echo "$FILENAME" | sed 's/[^a-zA-Z0-9._() -]/_/g')
+          else
+            FILENAME="$URL_FILENAME"
+          fi
+ 
+          echo "Downloading: $FILENAME"
+ 
+          curl -L --fail --retry 3 \
+            -o "temp_dl/$FILENAME" \
+            "$FILE_URL"
+ 
+          # Extract source domain
+          SOURCE_DOMAIN=$(python3 -c \
+            "from urllib.parse import urlparse; print(urlparse('$FILE_URL').netloc)" \
+            2>/dev/null || echo "unknown")
+ 
+          echo "filename=$FILENAME"             >> "$GITHUB_OUTPUT"
+          echo "filepath=temp_dl/$FILENAME"     >> "$GITHUB_OUTPUT"
+          echo "source_domain=$SOURCE_DOMAIN"   >> "$GITHUB_OUTPUT"
+ 
+      - name: Create Split Archive
+        id: archive
+        shell: bash
+        run: |
+          FILEPATH="${{ steps.download.outputs.filepath }}"
+          PASS="${{ github.event.inputs.zip_password }}"
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
+ 
+          if [[ -z "$THRESH_MB" || "$THRESH_MB" -le 0 || "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
+          fi
+ 
+          BASENAME=$(basename "$FILEPATH")
+ 
+          cd temp_dl || exit 1
+ 
+          ARCHIVE_BASE="${BASENAME%.*}_$(date +%Y%m%d_%H%M%S)"
+ 
+          if [ -n "$PASS" ]; then
+            7z a -p"$PASS" -mhe=on -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+          else
+            7z a -mx=3 -v${THRESH_MB}m "${ARCHIVE_BASE}.7z" "$BASENAME"
+          fi
+ 
+          if [ -f "${ARCHIVE_BASE}.7z.001" ] && [ ! -f "${ARCHIVE_BASE}.7z.002" ]; then
+            mv "${ARCHIVE_BASE}.7z.001" "${ARCHIVE_BASE}.7z"
+          fi
+ 
+          echo "archive_name=${ARCHIVE_BASE}.7z" >> "$GITHUB_OUTPUT"
+          echo "archive_base=${ARCHIVE_BASE}"     >> "$GITHUB_OUTPUT"
+ 
+          cd ..
+ 
+      - name: Get Current Date
+        id: get_date
+        shell: bash
+        run: |
+          echo "date=$(date '+%Y-%m-%d %H:%M:%S')" >> "$GITHUB_OUTPUT"
+ 
+      - name: Push to Repository
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+ 
+          mkdir -p downloads
+ 
+          mv temp_dl/* downloads/ 2>/dev/null || true
+ 
+          git add downloads/
+ 
+          git commit -m "Direct Download: ${{ steps.download.outputs.filename }} [skip ci]" || echo "Nothing to commit"
+ 
+          git push
+ 
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag != '' && github.event.inputs.release_tag || format('direct-{0}', github.run_number) }}
+          name: Direct Download Release
+          body: |
+            Direct download completed.
+ 
+            File: ${{ steps.download.outputs.filename }}
+            Date: ${{ steps.get_date.outputs.date }}
+          files: temp_dl/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+ 
+      - name: Update Links.md
+        shell: bash
+        env:
+          REPO:          ${{ github.repository }}
+          FILENAME:      ${{ steps.download.outputs.filename }}
+          ARCHIVE:       ${{ steps.archive.outputs.archive_name }}
+          ARCHIVE_BASE:  ${{ steps.archive.outputs.archive_base }}
+          SOURCE_DOMAIN: ${{ steps.download.outputs.source_domain }}
+          PASS:          ${{ github.event.inputs.zip_password }}
+        run: |
+          DOWNLOAD_DATE=$(date +'%Y-%m-%d %H:%M UTC')
+          export DOWNLOAD_DATE
+          export BRANCH="${GITHUB_REF_NAME}"
+ 
+          python3 << 'PYEOF'
+          import os, re, urllib.parse
+ 
+          repo          = os.environ.get('REPO', '')
+          branch        = os.environ.get('BRANCH', '')
+          filename      = os.environ.get('FILENAME', '')
+          archive       = os.environ.get('ARCHIVE', '')
+          archive_base  = os.environ.get('ARCHIVE_BASE', '')
+          source_domain = os.environ.get('SOURCE_DOMAIN', 'unknown')
+          zip_pass      = os.environ.get('PASS', '')
+          download_date = os.environ.get('DOWNLOAD_DATE', '')
+          dl_dir        = "downloads"
+ 
+          HEADER = (
+              "## 📦 Download Archive\n"
+              "> ❤ Made With Love by ValtorByte ❤<br><br/>\n\n"
+          )
+          FOOTER = "\n---\n\nClick on any link below to start downloading directly.\n"
+ 
+          def fsize(b):
+              return f"{b/1048576:.1f} MB" if b >= 1048576 else f"{b//1024} KB"
+ 
+          # Collect parts (same logic as original bash loop)
+          parts = []
+          if archive_base and os.path.isdir(dl_dir):
+              for f in sorted(os.listdir(dl_dir)):
+                  if f == f"{archive_base}.7z" or f.startswith(f"{archive_base}.7z."):
+                      parts.append(f)
+ 
+          # Fallback to raw file (mirrors original FOUND_PARTS==0 branch)
+          if not parts:
+              if filename and os.path.exists(f"{dl_dir}/{filename}"):
+                  parts = [filename]
+ 
+          total_bytes = sum(
+              os.path.getsize(f"{dl_dir}/{p}")
+              for p in parts if os.path.exists(f"{dl_dir}/{p}")
+          )
+ 
+          # Build entry
+          lines = []
+          lines.append(f"### 📁 {filename}")
+ 
+          meta = [f"🌐 `{source_domain}`", f"📥 `{download_date}`", f"📦 `{fsize(total_bytes)}`"]
+          if zip_pass:
+              meta.append("🔐 Password Protected")
+          lines.append("> " + " &nbsp;|&nbsp; ".join(meta))
+          lines.append("")
+ 
+          is_split = len(parts) > 1
+          part_num = 1
+          for part in parts:
+              encoded  = urllib.parse.quote(part)
+              raw_url  = f"https://github.com/{repo}/raw/{branch}/downloads/{encoded}"
+              fpath    = f"{dl_dir}/{part}"
+              size     = os.path.getsize(fpath) if os.path.exists(fpath) else 0
+              size_str = fsize(size)
+              ext      = part.rsplit('.', 1)[-1].lower() if '.' in part else ''
+ 
+              if ext in ('mp4', 'mkv', 'avi', 'mov'):    icon = "🎬"
+              elif ext in ('mp3', 'm4a', 'flac', 'ogg'):  icon = "🎵"
+              elif ext in ('7z', 'zip', 'rar') or re.match(r'^\d+$', ext): icon = "🗜️"
+              elif ext == 'pdf': icon = "📄"
+              else: icon = "📥"
+ 
+              # Mirror original label logic
+              if re.search(r'\.7z\.\d+$', part):
+                  label = f"دانلود — Part {part_num}"
+                  part_num += 1
+              else:
+                  label = "دانلود"
+ 
+              lines.append(
+                  f"- {icon} **[{label}]({raw_url})** &nbsp; `{size_str}` &nbsp; `{part}`"
+              )
+ 
+          lines.append("")
+          lines.append("---")
+          lines.append("")
+          current_entry = "\n".join(lines)
+ 
+          # Preserve old entries
+          old_entries = ""
+          if os.path.exists("Links.md"):
+              with open("Links.md", "r", encoding="utf-8") as f:
+                  content = f.read()
+              content = re.sub(r'\n*---\n+❤.*?❤\s*$', '', content, flags=re.DOTALL)
+              m = re.search(r'^### ', content, re.MULTILINE)
+              if m:
+                  old_entries = content[m.start():].rstrip()
+ 
+          with open("Links.md", "w", encoding="utf-8") as f:
+              f.write(HEADER)
+              f.write(current_entry)
+              if old_entries:
+                  f.write(old_entries + "\n")
+              f.write(FOOTER)
+          PYEOF
+ 
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Links.md
+          git commit -m "📝 Update Links.md: ${FILENAME} [skip ci]" || echo "Nothing to commit"
+          git push
+ 
+      - name: Cleanup
+        if: always()
+        shell: bash
+        run: |
+          rm -rf temp_dl
+ 
